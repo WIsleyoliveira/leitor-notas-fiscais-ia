@@ -1,46 +1,47 @@
-"""Chamada única ao Claude com saída estruturada (validada por Pydantic)."""
+"""Chamada a um modelo local do Ollama com saída estruturada (validada por Pydantic)."""
 
+import json
 import os
 from typing import TypeVar
 
-import anthropic
-from pydantic import BaseModel
+import ollama
+from pydantic import BaseModel, ValidationError
 
-MODELO = os.getenv("CLAUDE_MODEL", "claude-opus-5-5")
+MODELO = os.getenv("OLLAMA_MODEL", "llama3.1:8b")
+MODELO_VISAO = os.getenv("OLLAMA_MODEL_VISAO", "gemma3:4b")
 T = TypeVar("T", bound=BaseModel)
 
-_client = anthropic.Anthropic()  # lê ANTHROPIC_API_KEY do ambiente
+_client = ollama.Client(host=os.getenv("OLLAMA_HOST", "http://localhost:11434"))
 
 
 class ErroIA(Exception):
     pass
 
 
-def extrair(conteudo: str | list, esquema: type[T], instrucoes: str) -> T:
-    """Envia o conteúdo ao modelo e devolve um objeto do `esquema` já validado."""
-    try:
-        resposta = _client.beta.messages.parse(
-            model=MODELO,
-            max_tokens=16000,
-            system=instrucoes,
-            messages=[{"role": "user", "content": conteudo}],
-            output_format=esquema,
-            output_config={"effort": "low"},
-            # se o modelo recusar, a API tenta outro modelo na mesma chamada
-            betas=["server-side-fallback-2026-07-01"],
-            fallbacks="default",
-        )
-    except anthropic.AuthenticationError as e:
-        raise ErroIA("Chave da API inválida ou ausente (ANTHROPIC_API_KEY).") from e
-    except anthropic.RateLimitError as e:
-        raise ErroIA("Limite de requisições atingido. Tente de novo em instantes.") from e
-    except anthropic.APIStatusError as e:
-        raise ErroIA(f"Erro da API ({e.status_code}): {e.message}") from e
-    except anthropic.APIConnectionError as e:
-        raise ErroIA("Sem conexão com a API da Anthropic.") from e
+def extrair(texto: str, esquema: type[T], instrucoes: str, imagens: list[bytes] | None = None) -> T:
+    """Envia o texto (e imagens, se houver) ao modelo e devolve um objeto do `esquema` já validado."""
+    modelo = MODELO_VISAO if imagens else MODELO
+    formato = esquema.model_json_schema()
+    sistema = f"{instrucoes}\n\nResponda só com JSON neste esquema:\n{json.dumps(formato, ensure_ascii=False)}"
+    mensagem = {"role": "user", "content": texto}
+    if imagens:
+        mensagem["images"] = imagens
 
-    if resposta.stop_reason == "refusal":
-        raise ErroIA("O modelo recusou processar este conteúdo.")
-    if resposta.stop_reason == "max_tokens" or resposta.parsed_output is None:
-        raise ErroIA("A resposta veio incompleta. Tente com um conteúdo menor.")
-    return resposta.parsed_output
+    try:
+        resposta = _client.chat(
+            model=modelo,
+            messages=[{"role": "system", "content": sistema}, mensagem],
+            format=formato,  # o Ollama restringe a geração a este esquema JSON
+            options={"temperature": 0, "num_ctx": 16384},
+        )
+    except ConnectionError as e:
+        raise ErroIA("O Ollama não está rodando. Abra o app do Ollama ou rode `ollama serve`.") from e
+    except ollama.ResponseError as e:
+        if e.status_code == 404:
+            raise ErroIA(f"Modelo `{modelo}` não encontrado. Rode `ollama pull {modelo}`.") from e
+        raise ErroIA(f"Erro do Ollama: {e.error}") from e
+
+    try:
+        return esquema.model_validate_json(resposta.message.content)
+    except ValidationError as e:
+        raise ErroIA("O modelo respondeu fora do formato esperado. Tente de novo ou use um modelo maior.") from e

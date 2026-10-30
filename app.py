@@ -1,12 +1,13 @@
 """Leitor de Notas Fiscais com IA: foto ou PDF de nota/cupom -> planilha de lançamentos."""
 
-import base64
 import csv
 import io
+import re
 from typing import Literal
 
 import streamlit as st
 from pydantic import BaseModel, Field
+from pypdf import PdfReader
 
 from ia import ErroIA, extrair
 
@@ -42,18 +43,32 @@ com ponto como separador decimal. Nunca invente um CNPJ, data ou valor: se não
 estiver legível, deixe vazio e marque a confiança como baixa. Escolha a categoria
 de despesa que melhor descreve a compra."""
 
-TIPOS = {"png": "image/png", "jpg": "image/jpeg", "jpeg": "image/jpeg", "webp": "image/webp", "pdf": "application/pdf"}
+TIPOS = ["png", "jpg", "jpeg", "webp", "pdf"]
 
 
-def bloco_do_arquivo(nome: str, dados: bytes) -> dict:
-    tipo = TIPOS[nome.rsplit(".", 1)[-1].lower()]
-    fonte = {"type": "base64", "media_type": tipo, "data": base64.standard_b64encode(dados).decode()}
-    return {"type": "document" if tipo == "application/pdf" else "image", "source": fonte}
+def texto_do_pdf(dados: bytes) -> str:
+    return "\n".join(pagina.extract_text() or "" for pagina in PdfReader(io.BytesIO(dados)).pages).strip()
+
+
+def data_iso(data: str) -> str:
+    """Modelos pequenos às vezes devolvem DD/MM/AAAA mesmo pedindo AAAA-MM-DD."""
+    if m := re.fullmatch(r"(\d{2})[/.-](\d{2})[/.-](\d{4})", data.strip()):
+        return f"{m[3]}-{m[2]}-{m[1]}"
+    return data
 
 
 def ler_nota(nome: str, dados: bytes) -> Nota:
-    conteudo = [bloco_do_arquivo(nome, dados), {"type": "text", "text": "Extraia os dados desta nota."}]
-    return extrair(conteudo, Nota, INSTRUCOES)
+    if nome.lower().endswith(".pdf"):
+        # PDF de NF-e já tem texto: vai para o modelo de texto
+        texto = texto_do_pdf(dados)
+        if not texto:
+            raise ErroIA("PDF sem texto (provavelmente escaneado). Envie como imagem.")
+        nota = extrair(f"<nota>\n{texto}\n</nota>\n\nExtraia os dados desta nota.", Nota, INSTRUCOES)
+    else:
+        # foto de nota ou cupom: vai para o modelo com visão
+        nota = extrair("Extraia os dados da nota fiscal nesta imagem.", Nota, INSTRUCOES, imagens=[dados])
+    nota.data_emissao = data_iso(nota.data_emissao)
+    return nota
 
 
 def notas_em_csv(notas: dict[str, Nota]) -> str:
@@ -74,7 +89,7 @@ st.set_page_config(page_title="Leitor de Notas Fiscais com IA", page_icon="🧾"
 st.title("🧾 Leitor de Notas Fiscais com IA")
 st.caption("Envie fotos ou PDFs de notas e cupons. A IA lê cada um e monta a planilha de despesas.")
 
-arquivos = st.file_uploader("Notas fiscais", type=list(TIPOS), accept_multiple_files=True)
+arquivos = st.file_uploader("Notas fiscais", type=TIPOS, accept_multiple_files=True)
 
 if st.button("Ler notas", type="primary", disabled=not arquivos):
     notas: dict[str, Nota] = {}
